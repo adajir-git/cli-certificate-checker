@@ -1,1 +1,153 @@
-../checkcert
+#!/bin/sh
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+
+DOMAIN="$1"
+
+if [ -z "$DOMAIN" ]; then
+  echo "Usage: checkcert <domain>"
+  exit 1
+fi
+
+get_cert()
+{
+    openssl s_client -connect "$DOMAIN:443" -servername "$DOMAIN" </dev/null 2>/dev/null \
+      | sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p'
+}
+
+get_cert_dates()
+{
+    get_cert | openssl x509 -noout -dates 2>/dev/null
+}
+
+get_sans() {
+  if [ -n "$cert_sans_list" ]; then
+    echo "Subject Alternative Names:"
+    echo "$cert_sans_list" | while read -r san; do
+      [ -z "$san" ] && continue
+
+      if echo "$san" | grep -q '^\*\.'; then
+        printf "    - %-30s %s\n" "$san" "wildcard"
+        continue
+      fi
+
+      if echo "$san" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        ip="$san"
+      else
+        ip=$(dig +short A "$san" 2>/dev/null | head -n1)
+        [ -z "$ip" ] && ip="No DNS A record"
+      fi
+
+      printf "    - %-30s %s\n" "$san" "$ip"
+    done
+  fi
+}
+
+get_A_records() {
+  echo "IPv4:"
+  if [ -n "$record_A" ]; then
+    for ip in $record_A; do
+      ptr=$(dig +short -x "$ip")
+      printf "  %-16s (PTR: %s)\n" "$ip" "$ptr"
+    done
+  else
+    echo "  (no A records)"
+  fi
+}
+
+get_AAAA_records() {
+  echo "IPv6:"
+  if [ -n "$record_AAAA" ]; then
+    for ip6 in $record_AAAA; do
+      printf "  %s\n" "$ip6"
+    done
+  else
+    echo "  (no AAAA records)"
+  fi
+  echo
+}
+
+resolve_dns() {
+  record_A=$(dig +short A "$DOMAIN" 2>/dev/null)
+  record_AAAA=$(dig +short AAAA "$DOMAIN" 2>/dev/null)
+
+  if [ -z "$record_A" ] && [ -z "$record_AAAA" ]; then
+    echo "Domain: $DOMAIN"
+    echo "${RED}DNS error:${NC} no A or AAAA records found (domain does not resolve?)"
+    exit 1
+  fi
+}
+
+load_cert_dates() {
+  cert_dates=$(get_cert_dates "$DOMAIN")
+  cert_notbefore=$(echo "$cert_dates" | grep "notBefore" | cut -d= -f2)
+  cert_notafter=$(echo "$cert_dates" | grep "notAfter" | cut -d= -f2)
+
+  if [ -z "$cert_notbefore" ] || [ -z "$cert_notafter" ]; then
+    echo "Domain: $DOMAIN"
+    echo "${RED}Error:${NC} Could not retrieve certificate on port 443 (no HTTPS service? wrong hostname? TLS error?)"
+    exit 1
+  fi
+}
+
+compute_cert_status() {
+  exp_ts=$(date -d "$cert_notafter" +%s)
+  now_ts=$(date +%s)
+
+  seconds_left=$((exp_ts - now_ts))
+  days_left=$((seconds_left / 86400))
+
+  if [ "$seconds_left" -lt 0 ]; then
+    cert_status="${RED}EXPIRED${NC}"
+  elif [ "$days_left" -lt 14 ]; then
+    cert_status="${YELLOW}WARNING${NC} (expires in $days_left days)"
+  else
+    cert_status="${GREEN}VALID${NC} (expires in $days_left days)"
+  fi
+}
+
+load_cert_metadata() {
+  cert_issuer=$(get_cert | openssl x509 -noout -issuer)
+  cert_issuer_cn=$(echo "$cert_issuer" | sed -n 's/.*CN *= *\([^,\/]*\).*/\1/p')
+
+  cert_subject=$(get_cert | openssl x509 -noout -subject)
+  cert_cn=$(echo "$cert_subject" | sed -n 's/.*CN *= *\([^,\/]*\).*/\1/p')
+
+  cert_sans_raw=$(get_cert | openssl x509 -noout -ext subjectAltName 2>/dev/null)
+
+  cert_sans_list=$(echo "$cert_sans_raw" \
+    | tail -n +2 \
+    | tr ',' '\n' \
+    | sed 's/DNS://g; s/IP Address://g' \
+    | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+
+  server_header=$(curl -sI "https://$DOMAIN/" | sed -n 's/^Server:[[:space:]]*//p')
+}
+
+print_basic_info()
+{
+  echo "Domain: $DOMAIN"
+
+  echo
+
+  echo "Certificate:"
+  echo "  Status:        $cert_status"
+  echo "  Valid From:    $cert_notbefore"
+  echo "  Valid To:      $cert_notafter"
+  echo "  Common Name:   $cert_cn"
+  echo "  Issuer:        $cert_issuer_cn"
+  echo "  Server:        $server_header"
+}
+
+resolve_dns
+load_cert_dates
+compute_cert_status
+load_cert_metadata
+print_basic_info
+echo
+get_A_records
+get_AAAA_records
+get_sans
